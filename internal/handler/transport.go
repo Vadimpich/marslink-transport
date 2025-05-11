@@ -48,6 +48,7 @@ func (h *TransportHandler) SendMessage(w http.ResponseWriter, r *http.Request) {
 func (h *TransportHandler) TransferSegment(w http.ResponseWriter, r *http.Request) {
 	var seg model.Segment
 	if err := json.NewDecoder(r.Body).Decode(&seg); err != nil {
+		log.Printf("failed to unmarshal segment: %v", err)
 		http.Error(w, "invalid segment", http.StatusBadRequest)
 		return
 	}

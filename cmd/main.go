@@ -24,7 +24,7 @@ func main() {
 	cfg := config.Load()
 
 	reassembler := service.NewReassembler(cfg)
-	producer := kafka.NewProducer(strings.Split(cfg.KafkaBrokers, ","), "segment-topic")
+	producer := kafka.NewProducer([]string{"localhost:9092"}, "segment-topic")
 
 	h := handler.NewTransportHandler(producer, reassembler, cfg)
 
@@ -57,6 +57,6 @@ func main() {
 		}
 	}()
 
-	log.Println("Transport service started on :4000")
-	log.Fatal(http.ListenAndServe(":4000", r))
+	log.Println("Transport service started on :4001")
+	log.Fatal(http.ListenAndServe(":4001", r))
 }
