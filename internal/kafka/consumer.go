@@ -69,7 +69,7 @@ func (c *Consumer) forwardToChannel(segment model.Segment) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK || resp.StatusCode != http.StatusNoContent {
+	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		log.Printf("[Channel] Bad response: status=%d, body=%s", resp.StatusCode, string(body))
 	} else {

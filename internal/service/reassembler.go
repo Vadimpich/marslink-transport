@@ -12,10 +12,12 @@ import (
 )
 
 type bufferedMessage struct {
-	Sender        string
-	Segments      map[int]string
-	ReceivedAt    time.Time
-	TotalSegments int
+	Sender         string
+	Segments       map[int]string
+	ReceivedAt     time.Time
+	TotalSegments  int
+	LastConfirmed  int
+	FailedAttempts int
 }
 
 type Reassembler struct {
@@ -45,19 +47,19 @@ func (r *Reassembler) AddSegment(seg model.Segment) {
 	buf, ok := r.buffer[seg.MessageID]
 	if !ok {
 		buf = &bufferedMessage{
-			Sender:        seg.Sender,
-			Segments:      make(map[int]string),
-			TotalSegments: seg.TotalSegments,
-			ReceivedAt:    time.Now(),
+			Sender:         seg.Sender,
+			Segments:       make(map[int]string),
+			TotalSegments:  seg.TotalSegments,
+			ReceivedAt:     time.Now(),
+			LastConfirmed:  -1,
+			FailedAttempts: 0,
 		}
 		r.buffer[seg.MessageID] = buf
-		log.Printf("[Reassembler] New message %s from %s. Total segments: %d",
-			seg.MessageID, seg.Sender, seg.TotalSegments)
+		log.Printf("[Reassembler] New message %s from %s. Total segments: %d", seg.MessageID, seg.Sender, seg.TotalSegments)
 	}
 
 	buf.Segments[seg.SegmentIndex] = seg.Payload
 	buf.ReceivedAt = time.Now()
-
 	log.Printf("[Reassembler] Stored segment %d of message %s", seg.SegmentIndex, seg.MessageID)
 }
 
@@ -68,13 +70,12 @@ func (r *Reassembler) CheckTimeoutsAndAssemble() {
 	now := time.Now()
 	for messageID, buf := range r.buffer {
 		if messageID == "" {
-			log.Println("[ERROR] Reassembler buffer contains empty messageID")
 			continue
 		}
 
-		lastConfirmed := calculateLastConfirmedIndex(buf.Segments, buf.TotalSegments)
+		currentConfirmed := calculateLastConfirmedIndex(buf.Segments, buf.TotalSegments)
 
-		if lastConfirmed == buf.TotalSegments-1 {
+		if currentConfirmed == buf.TotalSegments-1 {
 			log.Printf("[Reassembler] Message %s fully received. Assembling...", messageID)
 
 			msg := model.Message{
@@ -85,27 +86,47 @@ func (r *Reassembler) CheckTimeoutsAndAssemble() {
 			}
 			go sendMessageToAppMars(msg, r.cfg)
 
-			ack := model.Ack{
+			go sendAckToChannel(model.Ack{
 				MessageID:            messageID,
-				LastConfirmedSegment: lastConfirmed,
-			}
-			go sendAckToChannel(ack, r.cfg)
+				LastConfirmedSegment: currentConfirmed,
+				Final:                true,
+			}, r.cfg)
 
 			delete(r.buffer, messageID)
 			continue
 		}
 
 		if now.Sub(buf.ReceivedAt) > r.timeout {
-			log.Printf("[Reassembler] Message %s timed out. Partial segments received. Last confirmed: %d",
-				messageID, lastConfirmed)
-
-			ack := model.Ack{
-				MessageID:            messageID,
-				LastConfirmedSegment: lastConfirmed,
+			if currentConfirmed > buf.LastConfirmed {
+				log.Printf("[Reassembler] Progress for message %s. Resetting fail counter.", messageID)
+				buf.FailedAttempts = 0
+				buf.LastConfirmed = currentConfirmed
+			} else {
+				buf.FailedAttempts++
+				log.Printf("[Reassembler] No progress for %s. Attempt %d", messageID, buf.FailedAttempts)
 			}
-			go sendAckToChannel(ack, r.cfg)
 
-			buf.ReceivedAt = now
+			if buf.FailedAttempts >= 2 {
+				log.Printf("[Reassembler] Message %s failed after %d timeouts. Sending final ACK", messageID, buf.FailedAttempts)
+
+				go sendAckToChannel(model.Ack{
+					MessageID:            messageID,
+					LastConfirmedSegment: buf.LastConfirmed,
+					Final:                true,
+				}, r.cfg)
+
+				delete(r.buffer, messageID)
+			} else {
+				log.Printf("[Reassembler] Message %s timed out. Sending intermediate ACK", messageID)
+
+				go sendAckToChannel(model.Ack{
+					MessageID:            messageID,
+					LastConfirmedSegment: buf.LastConfirmed,
+					Final:                false,
+				}, r.cfg)
+
+				buf.ReceivedAt = now
+			}
 		}
 	}
 }
@@ -147,17 +168,12 @@ func sendAckToChannel(ack model.Ack, cfg *config.Config) {
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		resp, err := http.Post(url, "application/json", bytes.NewReader(data))
-
 		if err == nil && resp.StatusCode == http.StatusOK {
-			log.Printf("[Reassembler] ACK sent to channel: messageId=%s, lastConfirmed=%d", ack.MessageID, ack.LastConfirmedSegment)
+			log.Printf("[Reassembler] ACK sent to channel: messageId=%s, lastConfirmed=%d, final=%v", ack.MessageID, ack.LastConfirmedSegment, ack.Final)
 			return
 		}
-
 		log.Printf("[Reassembler] Failed to send ACK attempt #%d for message %s: %v", attempt, ack.MessageID, err)
-
-		if attempt < maxRetries {
-			time.Sleep(retryDelay)
-		}
+		time.Sleep(retryDelay)
 	}
 
 	log.Printf("[Reassembler] ACK send aborted after %d attempts for message %s", maxRetries, ack.MessageID)

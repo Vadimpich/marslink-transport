@@ -1,14 +1,9 @@
 package service
 
 import (
-	"bytes"
-	"encoding/json"
-	"fmt"
 	"log"
-	"net/http"
 	"sync"
 	"time"
-
 	"transport/internal/config"
 	"transport/internal/model"
 )
@@ -23,9 +18,10 @@ type AckTracker struct {
 type TrackedMessage struct {
 	Segments      []model.Segment
 	LastConfirmed int
-	RetryDone     bool
+	RetryCount    int
 	TotalSegments int
-	Timer         *time.Timer
+	SentAt        time.Time
+	timer         *time.Timer
 }
 
 func NewAckTracker(cfg *config.Config) *AckTracker {
@@ -43,11 +39,11 @@ func (a *AckTracker) Track(msgID string, segments []model.Segment) {
 	tracked := &TrackedMessage{
 		Segments:      segments,
 		LastConfirmed: -1,
-		RetryDone:     false,
+		RetryCount:    0,
 		TotalSegments: len(segments),
+		SentAt:        time.Now(),
 	}
-
-	tracked.Timer = time.AfterFunc(a.timeout, func() {
+	tracked.timer = time.AfterFunc(a.timeout, func() {
 		a.handleTimeout(msgID)
 	})
 
@@ -64,28 +60,54 @@ func (a *AckTracker) HandleAck(ack model.Ack) (resend []model.Segment, done bool
 		return nil, false, false
 	}
 
-	tracked.Timer.Reset(a.timeout)
-
-	if ack.LastConfirmedSegment == tracked.TotalSegments-1 {
+	// Обработка финального ACK от Марса
+	if ack.Final {
+		log.Printf("[AckTracker] Final ACK received for message %s. Ending tracking.", ack.MessageID)
 		delete(a.messages, ack.MessageID)
-		log.Printf("[AckTracker] All segments confirmed for %s", ack.MessageID)
+		return nil, true, true
+	}
+
+	// Сброс таймера
+	tracked.timer.Stop()
+	tracked.timer.Reset(a.timeout)
+
+	// Успешно доставлены все сегменты
+	if ack.LastConfirmedSegment == tracked.TotalSegments-1 {
+		log.Printf("[AckTracker] All segments confirmed for message %s", ack.MessageID)
+		delete(a.messages, ack.MessageID)
 		return nil, true, false
 	}
 
+	// Нет прогресса
 	if ack.LastConfirmedSegment <= tracked.LastConfirmed {
-		if tracked.RetryDone {
+		tracked.RetryCount++
+		log.Printf("[AckTracker] No progress for %s. Retry #%d", ack.MessageID, tracked.RetryCount)
+
+		if tracked.RetryCount >= 1 {
+			log.Printf("[AckTracker] No progress after retry for %s. Sending Final ACK", ack.MessageID)
 			delete(a.messages, ack.MessageID)
-			log.Printf("[AckTracker] Retry already done for %s, marking as failed", ack.MessageID)
+
+			go func() {
+				err := SendFinalAck(model.Ack{
+					MessageID:            ack.MessageID,
+					LastConfirmedSegment: ack.LastConfirmedSegment,
+					Final:                true,
+				}, true, a.cfg)
+				if err != nil {
+					log.Printf("[AckTracker] Failed to send final ACK for %s: %v", ack.MessageID, err)
+				}
+			}()
+
 			return nil, false, true
 		}
-
-		log.Printf("[AckTracker] No progress for %s. Sending missing segments once", ack.MessageID)
-		tracked.RetryDone = true
 	} else {
-		log.Printf("[AckTracker] Progress detected for %s", ack.MessageID)
+		// Есть прогресс
 		tracked.LastConfirmed = ack.LastConfirmedSegment
+		tracked.RetryCount = 0
+		log.Printf("[AckTracker] Progress detected for %s. Resetting retry count.", ack.MessageID)
 	}
 
+	// Повторная отправка недостающих сегментов
 	for i := ack.LastConfirmedSegment + 1; i < tracked.TotalSegments; i++ {
 		resend = append(resend, tracked.Segments[i])
 	}
@@ -93,52 +115,27 @@ func (a *AckTracker) HandleAck(ack model.Ack) (resend []model.Segment, done bool
 	return resend, false, false
 }
 
-func (a *AckTracker) handleTimeout(msgID string) {
+func (a *AckTracker) handleTimeout(messageID string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	_, exists := a.messages[msgID]
+	tracked, exists := a.messages[messageID]
 	if !exists {
 		return
 	}
 
-	log.Printf("[AckTracker] Timeout exceeded for message %s. Sending error ACK", msgID)
-	delete(a.messages, msgID)
+	log.Printf("[AckTracker] Timeout exceeded for message %s. Sending Final=true ACK", messageID)
+	delete(a.messages, messageID)
 
-	err := SendFinalAck(model.Ack{
-		MessageID:            msgID,
-		LastConfirmedSegment: -1,
-	}, true, a.cfg)
+	go func() {
+		err := SendFinalAck(model.Ack{
+			MessageID:            messageID,
+			LastConfirmedSegment: tracked.LastConfirmed,
+			Final:                true,
+		}, true, a.cfg)
 
-	if err != nil {
-		log.Printf("[AckTracker] Failed to send error ACK for %s: %v", msgID, err)
-	}
-}
-
-func SendFinalAck(ack model.Ack, failed bool, cfg *config.Config) error {
-	status := "success"
-	if failed {
-		status = "error"
-	}
-
-	payload := model.FinalAck{
-		MessageID: ack.MessageID,
-		Status:    status,
-	}
-
-	body, _ := json.Marshal(payload)
-	url := cfg.AppEarthURL + "/receiveAck"
-
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("final ACK not accepted, status code: %d", resp.StatusCode)
-	}
-
-	log.Printf("[ACK] Final ACK sent to app-earth: %s (status=%s)", ack.MessageID, status)
-	return nil
+		if err != nil {
+			log.Printf("[AckTracker] Failed to send final timeout ACK for %s: %v", messageID, err)
+		}
+	}()
 }

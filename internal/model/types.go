@@ -30,10 +30,11 @@ type Message struct {
 type Ack struct {
 	MessageID            string `json:"messageId"`
 	LastConfirmedSegment int    `json:"lastConfirmedSegment"`
+	Final                bool   `json:"final"` // ← добавь это поле
 }
 
 type FinalAck struct {
-	MessageID string `json:"messageId"`
+	MessageID string `json:"messageID"`
 	Status    string `json:"status"` // "success" или "error"
 }
 
