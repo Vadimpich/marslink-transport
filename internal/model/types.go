@@ -32,6 +32,11 @@ type Ack struct {
 	LastConfirmedSegment int    `json:"lastConfirmedSegment"`
 }
 
+type FinalAck struct {
+	MessageID string `json:"messageId"`
+	Status    string `json:"status"` // "success" или "error"
+}
+
 func ToReader(v interface{}) *bytes.Reader {
 	data, _ := json.Marshal(v)
 	return bytes.NewReader(data)

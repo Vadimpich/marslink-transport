@@ -3,6 +3,8 @@ package kafka
 import (
 	"context"
 	"encoding/json"
+	"log"
+
 	"github.com/segmentio/kafka-go"
 	"transport/internal/model"
 )
@@ -24,6 +26,8 @@ func NewProducer(brokers []string, topic string) *Producer {
 func (p *Producer) SendSegment(segment model.Segment) error {
 	data, err := json.Marshal(segment)
 	if err != nil {
+		log.Printf("[Kafka] Failed to marshal segment %d of message %s: %v",
+			segment.SegmentIndex, segment.MessageID, err)
 		return err
 	}
 
@@ -32,5 +36,15 @@ func (p *Producer) SendSegment(segment model.Segment) error {
 		Value: data,
 	}
 
-	return p.writer.WriteMessages(context.Background(), msg)
+	err = p.writer.WriteMessages(context.Background(), msg)
+	if err != nil {
+		log.Printf("[Kafka] Failed to send segment %d of message %s: %v",
+			segment.SegmentIndex, segment.MessageID, err)
+		return err
+	}
+
+	log.Printf("[Kafka] Segment %d/%d of message %s successfully sent",
+		segment.SegmentIndex, segment.TotalSegments, segment.MessageID)
+
+	return nil
 }

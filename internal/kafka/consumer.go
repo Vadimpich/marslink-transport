@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"time"
 	"transport/internal/config"
+	"transport/internal/model"
 
 	"github.com/segmentio/kafka-go"
-	"transport/internal/model"
 )
 
 type Consumer struct {
@@ -32,20 +33,23 @@ func NewConsumer(brokers []string, topic string, groupID string, cfg *config.Con
 }
 
 func (c *Consumer) Start(ctx context.Context) {
-	log.Println("Kafka consumer started...")
+	log.Println("[Kafka] Consumer started...")
 
 	for {
 		m, err := c.reader.ReadMessage(ctx)
 		if err != nil {
-			log.Printf("error reading message: %v", err)
+			log.Printf("[Kafka] Error reading message: %v", err)
 			continue
 		}
 
 		var segment model.Segment
 		if err := json.Unmarshal(m.Value, &segment); err != nil {
-			log.Printf("invalid segment: %v", err)
+			log.Printf("[Kafka] Invalid segment JSON: %v", err)
 			continue
 		}
+
+		log.Printf("[Kafka] Consumed segment %d/%d from message %s",
+			segment.SegmentIndex, segment.TotalSegments, segment.MessageID)
 
 		go c.forwardToChannel(segment)
 	}
@@ -54,10 +58,21 @@ func (c *Consumer) Start(ctx context.Context) {
 func (c *Consumer) forwardToChannel(segment model.Segment) {
 	data, _ := json.Marshal(segment)
 	url := c.cfg.ChannelURL + "/processSegment"
-	resp, err := c.client.Post(url, "application/json",
-		bytes.NewReader(data))
 
-	if err != nil || resp.StatusCode != http.StatusOK {
-		log.Printf("failed to forward segment to channel: %v", err)
+	log.Printf("[Channel] Forwarding segment %d/%d of message %s to %s",
+		segment.SegmentIndex, segment.TotalSegments, segment.MessageID, url)
+
+	resp, err := c.client.Post(url, "application/json", bytes.NewReader(data))
+	if err != nil {
+		log.Printf("[Channel] Failed to forward segment: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("[Channel] Bad response: status=%d, body=%s", resp.StatusCode, string(body))
+	} else {
+		log.Printf("[Channel] Segment %d of message %s successfully forwarded", segment.SegmentIndex, segment.MessageID)
 	}
 }

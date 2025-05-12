@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
-	"github.com/gorilla/mux"
-	"github.com/joho/godotenv"
 	"log"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/gorilla/mux"
+	"github.com/joho/godotenv"
+
 	"transport/internal/config"
 	"transport/internal/handler"
 	"transport/internal/kafka"
@@ -16,33 +18,37 @@ import (
 
 func init() {
 	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found, using system env")
+		log.Println("[Init] No .env file found, using system env")
+	} else {
+		log.Println("[Init] .env loaded")
 	}
 }
 
 func main() {
 	cfg := config.Load()
 
+	// Инициализация компонентов
+	tracker := service.NewAckTracker()
 	reassembler := service.NewReassembler(cfg)
-	producer := kafka.NewProducer([]string{"localhost:9092"}, "segment-topic")
+	producer := kafka.NewProducer(strings.Split(cfg.KafkaBrokers, ","), "segment-topic")
+	handler := handler.NewTransportHandler(producer, reassembler, cfg, tracker)
 
-	h := handler.NewTransportHandler(producer, reassembler, cfg)
+	// Маршруты
+	router := mux.NewRouter()
+	router.HandleFunc("/sendMessage", handler.SendMessage).Methods("POST")
+	router.HandleFunc("/transferSegment", handler.TransferSegment).Methods("POST")
+	router.HandleFunc("/transferAck", handler.TransferAck).Methods("POST")
 
-	r := mux.NewRouter()
-	r.HandleFunc("/sendMessage", h.SendMessage).Methods("POST")
-	r.HandleFunc("/transferSegment", h.TransferSegment).Methods("POST")
-	r.HandleFunc("/transferAck", h.TransferAck).Methods("POST")
-
+	// Kafka consumer
 	ctx := context.Background()
+	consumer := kafka.NewConsumer(strings.Split(cfg.KafkaBrokers, ","), "segment-topic", "transport-group", cfg)
 
-	consumer := kafka.NewConsumer(
-		strings.Split(cfg.KafkaBrokers, ","),
-		"segment-topic",
-		"transport-group",
-		cfg,
-	)
-	go consumer.Start(ctx)
+	go func() {
+		log.Println("[Kafka] Starting consumer...")
+		consumer.Start(ctx)
+	}()
 
+	// Периодическая сборка сообщений
 	go func() {
 		ticker := time.NewTicker(cfg.CheckInterval)
 		defer ticker.Stop()
@@ -52,11 +58,16 @@ func main() {
 			case <-ticker.C:
 				reassembler.CheckTimeoutsAndAssemble()
 			case <-ctx.Done():
+				log.Println("[System] Shutting down ticker")
 				return
 			}
 		}
 	}()
 
-	log.Println("Transport service started on :4001")
-	log.Fatal(http.ListenAndServe(":4001", r))
+	// Запуск HTTP сервера
+	addr := ":" + cfg.TransportPort
+	log.Printf("[HTTP] Transport service listening on %s (public)", addr)
+	if err := http.ListenAndServe("0.0.0.0"+addr, router); err != nil {
+		log.Fatalf("[FATAL] HTTP server error: %v", err)
+	}
 }

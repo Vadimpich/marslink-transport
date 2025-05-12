@@ -8,27 +8,28 @@ import (
 	"sync"
 	"time"
 	"transport/internal/config"
-
 	"transport/internal/model"
 )
 
 type bufferedMessage struct {
+	Sender        string
 	Segments      map[int]string
 	ReceivedAt    time.Time
 	TotalSegments int
-	Sender        string
 }
 
 type Reassembler struct {
-	mu     sync.Mutex
-	buffer map[string]*bufferedMessage
-	cfg    *config.Config
+	mu      sync.Mutex
+	buffer  map[string]*bufferedMessage
+	timeout time.Duration
+	cfg     *config.Config
 }
 
 func NewReassembler(cfg *config.Config) *Reassembler {
 	return &Reassembler{
-		buffer: make(map[string]*bufferedMessage),
-		cfg:    cfg,
+		buffer:  make(map[string]*bufferedMessage),
+		timeout: cfg.Timeout,
+		cfg:     cfg,
 	}
 }
 
@@ -39,16 +40,20 @@ func (r *Reassembler) AddSegment(seg model.Segment) {
 	buf, ok := r.buffer[seg.MessageID]
 	if !ok {
 		buf = &bufferedMessage{
+			Sender:        seg.Sender,
 			Segments:      make(map[int]string),
 			TotalSegments: seg.TotalSegments,
 			ReceivedAt:    time.Now(),
-			Sender:        seg.Sender,
 		}
 		r.buffer[seg.MessageID] = buf
+		log.Printf("[Reassembler] New message %s from %s. Total segments: %d",
+			seg.MessageID, seg.Sender, seg.TotalSegments)
 	}
 
 	buf.Segments[seg.SegmentIndex] = seg.Payload
 	buf.ReceivedAt = time.Now()
+
+	log.Printf("[Reassembler] Stored segment %d of message %s", seg.SegmentIndex, seg.MessageID)
 }
 
 func (r *Reassembler) CheckTimeoutsAndAssemble() {
@@ -57,51 +62,79 @@ func (r *Reassembler) CheckTimeoutsAndAssemble() {
 
 	now := time.Now()
 	for messageID, buf := range r.buffer {
-		if len(buf.Segments) == buf.TotalSegments || now.Sub(buf.ReceivedAt) > r.cfg.Timeout {
-			content := make([]string, buf.TotalSegments)
-			hasError := false
+		lastConfirmed := calculateLastConfirmedIndex(buf.Segments, buf.TotalSegments)
 
-			for i := 0; i < buf.TotalSegments; i++ {
-				payload, ok := buf.Segments[i]
-				if !ok {
-					hasError = true
-					payload = "[MISSING]"
-				}
-				content[i] = payload
-			}
+		if lastConfirmed == buf.TotalSegments-1 {
+			log.Printf("[Reassembler] Message %s fully received. Assembling...", messageID)
 
-			final := model.Message{
+			msg := model.Message{
 				Sender:    buf.Sender,
-				Content:   joinSegments(content),
-				HasError:  hasError,
+				Content:   joinSegments(buf.Segments, buf.TotalSegments),
 				Timestamp: time.Now(),
+				HasError:  false,
 			}
+			go sendMessageToAppMars(msg, r.cfg)
 
-			go sendToAppLevel(final, r.cfg)
+			ack := model.Ack{
+				MessageID:            messageID,
+				LastConfirmedSegment: lastConfirmed,
+			}
+			go sendAckToChannel(ack, r.cfg)
+
+			delete(r.buffer, messageID)
+			continue
+		}
+
+		if now.Sub(buf.ReceivedAt) > r.timeout {
+			log.Printf("[Reassembler] Message %s timed out. Partial segments received. Last confirmed: %d",
+				messageID, lastConfirmed)
+
+			ack := model.Ack{
+				MessageID:            messageID,
+				LastConfirmedSegment: lastConfirmed,
+			}
+			go sendAckToChannel(ack, r.cfg)
+
 			delete(r.buffer, messageID)
 		}
 	}
 }
 
-func joinSegments(parts []string) string {
+func calculateLastConfirmedIndex(segments map[int]string, total int) int {
+	for i := 0; i < total; i++ {
+		if _, ok := segments[i]; !ok {
+			return i - 1
+		}
+	}
+	return total - 1
+}
+
+func joinSegments(parts map[int]string, total int) string {
 	var buf bytes.Buffer
-	for _, p := range parts {
-		buf.WriteString(p)
+	for i := 0; i < total; i++ {
+		buf.WriteString(parts[i])
 	}
 	return buf.String()
 }
 
-func sendToAppLevel(msg model.Message, cfg *config.Config) {
-	data, err := json.Marshal(msg)
-	if err != nil {
-		log.Printf("failed to marshal message: %v", err)
-		return
-	}
-
+func sendMessageToAppMars(msg model.Message, cfg *config.Config) {
+	data, _ := json.Marshal(msg)
 	url := cfg.AppMarsURL + "/receiveMessage"
 	resp, err := http.Post(url, "application/json", bytes.NewReader(data))
 	if err != nil || resp.StatusCode != http.StatusOK {
-		log.Printf("failed to send to app level: %v", err)
+		log.Printf("[Reassembler] Failed to send message %s to app-mars: %v", msg.Sender, err)
 		return
 	}
+	log.Printf("[Reassembler] Message from %s successfully sent to app-mars", msg.Content)
+}
+
+func sendAckToChannel(ack model.Ack, cfg *config.Config) {
+	data, _ := json.Marshal(ack)
+	url := cfg.ChannelURL + "/processAck"
+	resp, err := http.Post(url, "application/json", bytes.NewReader(data))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		log.Printf("[Reassembler] Failed to send ACK for message %s: %v", ack.MessageID, err)
+		return
+	}
+	log.Printf("[Reassembler] ACK sent to channel: messageId=%s, lastConfirmed=%d", ack.MessageID, ack.LastConfirmedSegment)
 }
