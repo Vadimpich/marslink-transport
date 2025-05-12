@@ -28,7 +28,7 @@ func main() {
 	cfg := config.Load()
 
 	// Инициализация компонентов
-	tracker := service.NewAckTracker()
+	tracker := service.NewAckTracker(cfg)
 	reassembler := service.NewReassembler(cfg)
 	producer := kafka.NewProducer(strings.Split(cfg.KafkaBrokers, ","), "segment-topic")
 	handler := handler.NewTransportHandler(producer, reassembler, cfg, tracker)

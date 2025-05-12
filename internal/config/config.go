@@ -14,6 +14,7 @@ type Config struct {
 	KafkaBrokers  string
 	SegmentSize   int
 	Timeout       time.Duration
+	AckTimeout    time.Duration
 	CheckInterval time.Duration
 	TransportPort string
 }
@@ -29,6 +30,11 @@ func Load() *Config {
 		log.Fatalf("[Config] Invalid TIMEOUT_DURATION: %v", err)
 	}
 
+	ackTimeout, err := time.ParseDuration(getEnv("ACK_TIMEOUT", "30s"))
+	if err != nil {
+		log.Fatalf("[Config] Invalid ACK_TIMEOUT: %v", err)
+	}
+
 	interval, err := time.ParseDuration(getEnv("CHECK_INTERVAL", "5s"))
 	if err != nil {
 		log.Fatalf("[Config] Invalid CHECK_INTERVAL: %v", err)
@@ -41,6 +47,7 @@ func Load() *Config {
 		KafkaBrokers:  os.Getenv("KAFKA_BROKERS"),
 		SegmentSize:   segmentSize,
 		Timeout:       timeout,
+		AckTimeout:    ackTimeout,
 		CheckInterval: interval,
 		TransportPort: getEnv("TRANSPORT_PORT", "4000"),
 	}
@@ -52,6 +59,7 @@ func Load() *Config {
 	log.Printf("  KAFKA_BROKERS:   %s", cfg.KafkaBrokers)
 	log.Printf("  SEGMENT_SIZE:    %d", cfg.SegmentSize)
 	log.Printf("  TIMEOUT:         %v", cfg.Timeout)
+	log.Printf("  ACK_TIMEOUT:     %v", cfg.AckTimeout)
 	log.Printf("  CHECK_INTERVAL:  %v", cfg.CheckInterval)
 	log.Printf("  TRANSPORT_PORT:  %s", cfg.TransportPort)
 

@@ -2,13 +2,12 @@ FROM golang:1.24
 
 WORKDIR /app
 
-COPY go.mod .
-COPY go.sum .
-
-RUN go mod tidy
+COPY go.mod go.sum ./
+RUN go mod download
 
 COPY . .
+RUN go build -o transport ./cmd/main.go
 
-RUN go build -o transport-service ./cmd
+EXPOSE 4000
 
-CMD ["./transport-service"]
+CMD ["./transport"]
